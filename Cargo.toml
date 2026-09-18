@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+anyhow = "1.0.104"
+serde = { version = "1", features = ["derive"] }
