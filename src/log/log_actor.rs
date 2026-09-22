@@ -2,7 +2,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::log::{
     command::LogCommand,
-    logs::{LogEntry, RaftLog},
+    raft_log::{LogEntry, RaftLog},
 };
 
 struct LogActor {
@@ -52,6 +52,9 @@ impl LogActor {
             } => {
                 let _ = reply.send(self.log.matches(prev_log_index, prev_log_term));
             }
+            LogCommand::TermAt { index, reply } => {
+                let _ = reply.send(self.log.term_at(index));
+            }
         }
     }
 
@@ -62,7 +65,7 @@ impl LogActor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LogHandle {
     tx: mpsc::Sender<LogCommand>,
 }
@@ -167,5 +170,117 @@ impl LogHandle {
             .await
             .expect("LogActor has shut down");
         reply_rx.await.expect("LogActor dropped reply")
+    }
+
+    pub async fn term_at(&self, index: u64) -> Option<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(LogCommand::TermAt {
+                index,
+                reply: reply_tx,
+            })
+            .await
+            .expect("LogActor has shut down");
+        reply_rx.await.expect("LogActor dropped reply")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::log::{log_actor::LogHandle, raft_log::LogEntry};
+
+    fn normal(i: u64, t: u64, s: &[u8]) -> LogEntry {
+        LogEntry::normal(i, t, s.to_vec())
+    }
+
+    #[tokio::test]
+    async fn spawn_add_append() {
+        let log = LogHandle::spawn();
+        assert_eq!(log.last_info().await, (0, 0));
+
+        let ok = log
+            .append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")])
+            .await;
+        assert!(ok);
+        assert_eq!(log.last_info().await, (2, 1));
+    }
+
+    #[tokio::test]
+    async fn append_conflict_overwrites() {
+        let log = LogHandle::spawn();
+        log.append(
+            0,
+            0,
+            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+        )
+        .await;
+
+        let ok = log
+            .append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")])
+            .await;
+        assert!(ok);
+
+        assert_eq!(log.get(2).await.unwrap().term, 2);
+        assert_eq!(log.get(3).await.unwrap().term, 2);
+        assert_eq!(log.last_info().await, (3, 2));
+    }
+
+    #[tokio::test]
+    async fn truncate_from_actor() {
+        let log = LogHandle::spawn();
+        log.append(
+            0,
+            0,
+            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+        )
+        .await;
+
+        let removed = log.truncate_from(2).await;
+        assert_eq!(removed, 2);
+        assert_eq!(log.last_info().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn slice_actor() {
+        let log = LogHandle::spawn();
+        log.append(
+            0,
+            0,
+            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+        )
+        .await;
+
+        let s = log.slice(1, 2).await;
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].index, 1);
+        assert_eq!(s[1].index, 2);
+    }
+
+    #[tokio::test]
+    async fn matches_actor() {
+        let log = LogHandle::spawn();
+        log.append(0, 0, vec![normal(1, 1, b"a")]).await;
+
+        assert!(log.matches(0, 0).await);
+        assert!(log.matches(1, 1).await);
+        assert!(!log.matches(1, 2).await);
+    }
+
+    #[tokio::test]
+    async fn handle_is_clonable() {
+        let log = LogHandle::spawn();
+        let log2 = log.clone();
+
+        log.append(0, 0, vec![normal(1, 1, b"a")]).await;
+        assert_eq!(log2.last_info().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn actor_exits_when_all_handles_dropped() {
+        let log = LogHandle::spawn();
+        let log2 = log.clone();
+        drop(log);
+        drop(log2);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

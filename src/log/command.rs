@@ -1,6 +1,6 @@
 use tokio::sync::oneshot;
 
-use crate::log::logs::LogEntry;
+use crate::log::raft_log::LogEntry;
 
 pub enum LogCommand {
     /// raft core: append / overwrite logs
@@ -47,5 +47,10 @@ pub enum LogCommand {
         prev_log_index: u64,
         prev_log_term: u64,
         reply: oneshot::Sender<bool>,
+    },
+
+    TermAt {
+        index: u64,
+        reply: oneshot::Sender<Option<u64>>,
     },
 }

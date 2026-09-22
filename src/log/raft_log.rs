@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 // ============================================================
 // LogEntry
 // ============================================================
-#[derive(Debug, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
 pub enum EntryType {
     /// normal log, append data
     Normal,
@@ -11,7 +11,7 @@ pub enum EntryType {
     Empty,
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
+#[derive(Debug, Eq, PartialEq, PartialOrd, Serialize, Deserialize, Clone)]
 pub struct LogEntry {
     pub index: u64,
     pub term: u64,
