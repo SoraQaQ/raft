@@ -10,7 +10,7 @@ pub enum NodeCommand {
 
     ClientPropose {
         data: Vec<u8>,
-        reply: oneshot::Sender<ProposeResut>,
+        reply: oneshot::Sender<ProposeResult>,
     },
 
     ElectionTick,
@@ -25,16 +25,23 @@ pub enum NodeCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposeResut {
+pub struct ProposeResult {
     pub accepted: bool,
     pub index: Option<u64>,
 }
 
-impl ProposeResut {
-    pub fn rejectd() -> Self {
+impl ProposeResult {
+    pub fn rejected() -> Self {
         Self {
             accepted: false,
             index: None,
+        }
+    }
+
+    pub fn accepted(index: u64) -> Self {
+        Self {
+            accepted: true,
+            index: Some(index),
         }
     }
 }

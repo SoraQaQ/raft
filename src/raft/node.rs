@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     log::{log_actor::LogHandle, raft_log::LogEntry},
     raft::{
+        command::{InspectResult, NodeCommand, ProposeResult},
         message::RaftMessage,
         role::RaftRole,
         state::{NodeId, RaftState},
@@ -108,18 +109,53 @@ impl RaftNode {
         }
     }
 
-    /// send heartbeat(empty entries) to all peer
-    async fn broadcast_heartbeat(&self) {
-        let (last_log_index, last_log_term) = self.log.last_info().await;
-        let msg = RaftMessage::AppendEntires {
-            term: self.state.current_term,
-            leader_id: self.id,
-            prev_log_index: last_log_index,
-            prev_log_term: last_log_term,
-            entries: vec![],
-            leader_commit: self.state.commit_index,
-        };
-        self.broadcast(msg).await;
+    // ========================================================
+    // RPC handler
+    // ========================================================
+
+    async fn handle_raft(&mut self, from: NodeId, msg: RaftMessage) {
+        match msg {
+            RaftMessage::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.handle_request_vote(from, term, candidate_id, last_log_index, last_log_term)
+                    .await;
+            }
+            RaftMessage::AppendEntires {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
+                self.handle_append_entries(
+                    from,
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                )
+                .await;
+            }
+            RaftMessage::AppendEntiresResp {
+                term,
+                success,
+                match_index,
+            } => {
+                self.handle_append_entries_resp(from, term, success, match_index)
+                    .await;
+            }
+            RaftMessage::VoteResp { term, vote_granted } => {
+                self.handle_request_vote_resp(from, term, vote_granted)
+                    .await;
+            }
+        }
     }
 
     // ========================================================
@@ -307,6 +343,25 @@ impl RaftNode {
         }
     }
 
+    // ========================================================
+    // Leader
+    // ========================================================
+
+    /// send heartbeat(empty entries) to all peer
+    async fn broadcast_heartbeat(&self) {
+        let (last_log_index, last_log_term) = self.log.last_info().await;
+        let msg = RaftMessage::AppendEntires {
+            term: self.state.current_term,
+            leader_id: self.id,
+            prev_log_index: last_log_index,
+            prev_log_term: last_log_term,
+            entries: vec![],
+            leader_commit: self.state.commit_index,
+        };
+        self.broadcast(msg).await;
+    }
+
+    /// try to advance commit_index according to the majority
     async fn maybe_advance_commit(&mut self) {
         if !self.is_leader() {
             return;
@@ -339,6 +394,7 @@ impl RaftNode {
         //TODO: apply log
     }
 
+    /// send appendentries to a single peer(decide what to send based on next_index)
     async fn send_append_entries_to(&self, peer: NodeId) {
         let next_index = match self.state.as_leader() {
             Some(l) => match l.next_index.get(&peer) {
@@ -381,7 +437,151 @@ impl RaftNode {
         .await;
     }
 
+    // ========================================================
+    // Client Proposal
+    // ========================================================
+
+    async fn handle_propose(&mut self, data: Vec<u8>) -> ProposeResult {
+        if !self.is_leader() {
+            return ProposeResult::rejected();
+        }
+
+        let (last_index, _) = self.log.last_info().await;
+        let new_index = last_index + 1;
+        let entry = LogEntry::normal(new_index, self.state.current_term, data);
+
+        let ok = self
+            .log
+            .append(last_index, self.state.current_term, vec![entry])
+            .await;
+
+        if !ok {
+            return ProposeResult::rejected();
+        }
+
+        for &peer in &self.peers {
+            self.send_append_entries_to(peer).await;
+        }
+
+        ProposeResult::accepted(new_index)
+    }
+
+    // ========================================================
+    // Timer
+    // ========================================================
+
     fn reset_election_timer(&self) {
         unimplemented!();
+    }
+
+    async fn handle_election_tick(&mut self) {
+        if self.is_leader() {
+            return;
+        }
+        self.become_candidate().await;
+    }
+
+    async fn handle_heartbeat_tick(&mut self) {
+        if !self.is_leader() {
+            return;
+        }
+        self.broadcast_heartbeat().await;
+    }
+
+    // ========================================================
+    // actor loop
+    // ========================================================
+
+    pub async fn run(mut self, mut rx: mpsc::Receiver<NodeCommand>) {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                NodeCommand::Raft { from, msg } => {
+                    self.handle_raft(from, msg).await;
+                }
+                NodeCommand::ClientPropose { data, reply } => {
+                    let result = self.handle_propose(data).await;
+                    let _ = reply.send(result);
+                }
+                NodeCommand::ElectionTick => {
+                    self.handle_election_tick().await;
+                }
+                NodeCommand::HeartbeatTick => {
+                    self.handle_heartbeat_tick().await;
+                }
+                NodeCommand::ResetElectionTimer => {
+                    self.reset_election_timer();
+                }
+                NodeCommand::Inspect { reply } => {
+                    let (last_index, _) = self.log.last_info().await;
+                    let _ = reply.send(InspectResult {
+                        role: self.state.role,
+                        term: self.state.current_term,
+                        commit_index: self.state.commit_index,
+                        last_index: last_index,
+                        voted_for: self.state.voted_for,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub struct NodeHandle {
+    pub id: NodeId,
+    tx: mpsc::Sender<NodeCommand>,
+}
+
+impl NodeHandle {
+    pub fn spawn(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        log: LogHandle,
+        peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(1024);
+        let node = RaftNode::new(id, peers, log, peer_txs);
+        tokio::spawn(node.run(rx));
+        Self { id, tx }
+    }
+
+    pub async fn send_raft(&self, from: NodeId, msg: RaftMessage) {
+        let _ = self.tx.send(NodeCommand::Raft { from, msg }).await;
+    }
+
+    pub async fn propose(&self, data: Vec<u8>) -> ProposeResult {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(NodeCommand::ClientPropose {
+                data,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return ProposeResult::rejected();
+        }
+        reply_rx.await.unwrap_or_else(|_| ProposeResult::rejected())
+    }
+
+    pub async fn inspect(&self) -> InspectResult {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(NodeCommand::Inspect { reply: reply_tx }).await;
+
+        reply_rx.await.unwrap_or(InspectResult {
+            role: RaftRole::Follower,
+            term: 0,
+            commit_index: 0,
+            last_index: 0,
+            voted_for: None,
+        })
+    }
+
+    pub async fn election_tick(&self) {
+        let _ = self.tx.send(NodeCommand::ElectionTick).await;
+    }
+
+    pub async fn heartbeat_tick(&self) {
+        let _ = self.tx.send(NodeCommand::HeartbeatTick).await;
     }
 }
