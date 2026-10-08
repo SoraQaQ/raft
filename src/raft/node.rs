@@ -75,6 +75,7 @@ impl RaftNode {
 
     fn become_follower(&mut self, term: u64) {
         self.state.become_follower(term);
+        self.reset_election_timer();
     }
 
     async fn become_candidate(&mut self) {
@@ -89,12 +90,14 @@ impl RaftNode {
         };
         self.broadcast(msg).await;
         self.check_election_won().await;
+        self.reset_election_timer();
     }
 
     async fn become_leader(&mut self) {
         let last_log_index = self.log.last_info().await.0;
         self.state.become_leader(&self.peers, last_log_index);
         self.broadcast_heartbeat().await;
+        self.reset_election_timer();
     }
 
     ///check election won
@@ -171,7 +174,7 @@ impl RaftNode {
     ) {
         if term < self.state.current_term {
             let msg = RaftMessage::VoteResp {
-                term,
+                term: self.state.current_term,
                 vote_granted: false,
             };
 
@@ -190,7 +193,7 @@ impl RaftNode {
         if can_vote {
             let (my_last_index, my_last_term) = self.log.last_info().await;
             let up_to_date = last_log_term > my_last_term
-                || (last_log_term == my_last_term && last_log_index > my_last_index);
+                || (last_log_term == my_last_term && last_log_index >= my_last_index);
 
             if up_to_date {
                 grant = true;
@@ -202,7 +205,7 @@ impl RaftNode {
         self.send_to(
             from,
             RaftMessage::VoteResp {
-                term,
+                term: self.state.current_term,
                 vote_granted: grant,
             },
         )
@@ -250,7 +253,7 @@ impl RaftNode {
             self.send_to(
                 from,
                 RaftMessage::AppendEntiresResp {
-                    term,
+                    term: self.state.current_term,
                     success: false,
                     match_index: match_index,
                 },
@@ -267,6 +270,8 @@ impl RaftNode {
             }
         }
 
+        self.reset_election_timer();
+
         let matches = self.log.matches(prev_log_index, prev_log_term).await;
 
         if !matches {
@@ -274,7 +279,7 @@ impl RaftNode {
             self.send_to(
                 from,
                 RaftMessage::AppendEntiresResp {
-                    term,
+                    term: self.state.current_term,
                     success: false,
                     match_index: match_index,
                 },
@@ -289,20 +294,20 @@ impl RaftNode {
             .await;
 
         let last_new_index = prev_log_index + entries_len;
+
+        // The commit index must be monotonically non-decreasing.
         if leader_commit > self.state.commit_index {
-            self.state.commit_index = leader_commit.min(last_new_index);
+            let new_commit_index = leader_commit.min(last_new_index);
+            self.state.commit_index = self.state.commit_index.max(new_commit_index);
             //TODO: apply log
         }
 
-        self.reset_election_timer();
-
-        let match_index = self.log.last_info().await.0;
         self.send_to(
             from,
             RaftMessage::AppendEntiresResp {
-                term,
+                term: self.state.current_term,
                 success: true,
-                match_index: match_index,
+                match_index: last_new_index,
             },
         )
         .await;
@@ -326,9 +331,13 @@ impl RaftNode {
 
         // update match index, next index
         if success {
+            // The (match_index/next_index) must be monotonically non-decreasing.
             if let Some(leader) = self.state.as_leader_mut() {
-                leader.match_index.insert(from, match_index);
-                leader.next_index.insert(from, match_index + 1);
+                let matched = leader.match_index.entry(from).or_insert(0);
+                *matched = (*matched).max(match_index);
+
+                let next = leader.next_index.entry(from).or_insert(1);
+                *next = (*next).max(match_index + 1);
             }
             self.maybe_advance_commit().await;
         } else {
@@ -389,8 +398,7 @@ impl RaftNode {
             return;
         }
 
-        self.state.current_term = term_at;
-
+        self.state.commit_index = majority_index;
         //TODO: apply log
     }
 
@@ -418,7 +426,7 @@ impl RaftNode {
 
         // sliec[next_index, last_index]
         let entries = if last_index >= next_index {
-            self.log.slice(last_index, next_index).await
+            self.log.slice(next_index, last_index).await
         } else {
             vec![]
         };
@@ -431,7 +439,7 @@ impl RaftNode {
                 prev_log_index,
                 prev_log_term,
                 entries,
-                leader_commit: self.state.current_term,
+                leader_commit: self.state.commit_index,
             },
         )
         .await;
@@ -446,14 +454,11 @@ impl RaftNode {
             return ProposeResult::rejected();
         }
 
-        let (last_index, _) = self.log.last_info().await;
+        let (last_index, last_term) = self.log.last_info().await;
         let new_index = last_index + 1;
         let entry = LogEntry::normal(new_index, self.state.current_term, data);
 
-        let ok = self
-            .log
-            .append(last_index, self.state.current_term, vec![entry])
-            .await;
+        let ok = self.log.append(last_index, last_term, vec![entry]).await;
 
         if !ok {
             return ProposeResult::rejected();
@@ -575,13 +580,5 @@ impl NodeHandle {
             last_index: 0,
             voted_for: None,
         })
-    }
-
-    pub async fn election_tick(&self) {
-        let _ = self.tx.send(NodeCommand::ElectionTick).await;
-    }
-
-    pub async fn heartbeat_tick(&self) {
-        let _ = self.tx.send(NodeCommand::HeartbeatTick).await;
     }
 }
