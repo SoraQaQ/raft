@@ -51,10 +51,6 @@ impl CandidateState {
     pub fn count(&self) -> usize {
         self.votes.len()
     }
-
-    pub fn is_majority(&self, cluster_size: usize) -> bool {
-        self.count() > cluster_size / 2
-    }
 }
 
 pub struct RaftState {
