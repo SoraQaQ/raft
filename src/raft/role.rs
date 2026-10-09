@@ -1,5 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Default)]
 pub enum RaftRole {
+    #[default]
     Follower,
     Candidate,
     Leader,

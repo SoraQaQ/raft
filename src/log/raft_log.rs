@@ -131,7 +131,7 @@ impl RaftLog {
     ///
     /// `from_index < offset` no-op
     /// `from_index` > last_index: no-op
-    pub fn truncate_from(&mut self, from_index: u64) -> usize {
+    fn truncate_from(&mut self, from_index: u64) -> usize {
         if from_index < self.offset {
             return 0;
         }
@@ -145,14 +145,6 @@ impl RaftLog {
         removed
     }
 
-    /// retain `[offset, upto_index]`, and delete everything after it.
-    /// returns the number of deleted items.
-    ///
-    /// equivalent to `truncate_from(upto_index+1)`
-    pub fn truncate_suffix(&mut self, upto_index: u64) -> usize {
-        self.truncate_from(upto_index.saturating_add(1))
-    }
-
     /// delete single logs(by index)
     pub fn remove(&mut self, index: u64) -> Option<LogEntry> {
         if index < self.offset || index > self.last_index() {
@@ -164,13 +156,13 @@ impl RaftLog {
     /// append/overwrite log entries
     ///
     /// steps:
-    /// 1. consistency check (`prev_log_index / prev_log_term`);
-    /// return false and leave state unchanged if it fails
+    /// 1. consistency check (`prev_log_index / prev_log_term`); return false and leave state unchanged if it fails
     ///
-    /// 2. find the fist point if conflict(local entry has the same index but a different term)
-    /// and truncate starting from that point
+    /// 2. find the fist point if conflict(local entry has the same index but a different term) and truncate starting from that point
     ///
     /// 3. append entries not present locally(idempotent)
+    ///
+    /// 4. check committed index, if truncate idx <= committed return `false`
     ///
     /// return `true` to indicate a successful write
     pub fn append(
@@ -178,6 +170,7 @@ impl RaftLog {
         prev_log_index: u64,
         prev_log_term: u64,
         entries: Vec<LogEntry>,
+        committed: u64,
     ) -> bool {
         if !self.matches(prev_log_index, prev_log_term) {
             return false;
@@ -197,6 +190,9 @@ impl RaftLog {
         }
 
         if let Some(idx) = conflict_at {
+            if committed >= idx {
+                return false;
+            }
             self.truncate_from(idx);
         }
 
@@ -254,7 +250,7 @@ mod tests {
     #[test]
     fn append_from_scratch() {
         let mut log = RaftLog::new();
-        let ok = log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")]);
+        let ok = log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
         assert!(ok);
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.last_term(), 1);
@@ -266,11 +262,11 @@ mod tests {
     fn append_rejects_bad_prev() {
         let mut log = RaftLog::new();
 
-        log.append(0, 0, vec![normal(1, 1, b"a")]);
+        log.append(0, 0, vec![normal(1, 1, b"a")], 0);
 
-        assert!(!log.append(1, 99, vec![normal(2, 1, b"b")]));
+        assert!(!log.append(1, 99, vec![normal(2, 1, b"b")], 0));
 
-        assert!(!log.append(5, 1, vec![normal(6, 1, b"b")]));
+        assert!(!log.append(5, 1, vec![normal(6, 1, b"b")], 0));
 
         assert_eq!(log.last_index(), 1);
     }
@@ -287,6 +283,7 @@ mod tests {
                 normal(3, 1, b"c"),
                 normal(4, 2, b"d"),
             ],
+            0,
         );
 
         assert_eq!(log.last_index(), 4);
@@ -301,7 +298,7 @@ mod tests {
     #[test]
     fn truncate_from_all() {
         let mut log = RaftLog::new();
-        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")]);
+        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
 
         let removed = log.truncate_from(log.offset);
         assert_eq!(removed, 2);
@@ -312,7 +309,7 @@ mod tests {
     #[test]
     fn truncate_from_out_of_range_is_noop() {
         let mut log = RaftLog::new();
-        log.append(0, 0, vec![normal(1, 1, b"a")]);
+        log.append(0, 0, vec![normal(1, 1, b"a")], 0);
 
         assert_eq!(log.truncate_from(99), 0);
         assert_eq!(log.truncate_from(0), 0);
@@ -320,18 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn truncate_suffix_keeps_prefix() {
+    fn append_refuses_to_truncate_committed() {
         let mut log = RaftLog::new();
-        log.append(
-            0,
-            0,
-            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
-        );
-
-        let removed = log.truncate_suffix(1);
-        assert_eq!(removed, 2);
-        assert_eq!(log.last_index(), 1);
-        assert_eq!(log.get(1).unwrap().data, b"a");
+        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
+        let ok = log.append(1, 1, vec![normal(2, 2, b"b")], 2);
+        assert!(!ok);
     }
 
     #[test]
@@ -341,9 +331,10 @@ mod tests {
             0,
             0,
             vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+            0,
         );
 
-        let ok = log.append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")]);
+        let ok = log.append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0);
         assert!(ok);
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.last_term(), 2);
@@ -355,9 +346,9 @@ mod tests {
     fn append_is_idempotent_on_same_entries() {
         let mut log = RaftLog::new();
         let entries = vec![normal(1, 1, b"a"), normal(2, 1, b"b")];
-        log.append(0, 0, entries.clone());
+        log.append(0, 0, entries.clone(), 0);
 
-        let ok = log.append(0, 0, entries);
+        let ok = log.append(0, 0, entries, 0);
         assert!(ok);
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.len(), 2);
@@ -366,12 +357,13 @@ mod tests {
     #[test]
     fn append_partial_overlap() {
         let mut log = RaftLog::new();
-        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")]);
+        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
 
         let ok = log.append(
             1,
             1,
             vec![normal(2, 1, b"b"), normal(3, 1, b"c"), normal(4, 1, b"d")],
+            0,
         );
 
         assert!(ok);
@@ -382,9 +374,9 @@ mod tests {
     #[test]
     fn append_extends_with_higher_term() {
         let mut log = RaftLog::new();
-        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")]);
+        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
 
-        let ok = log.append(2, 1, vec![normal(3, 2, b"c"), normal(4, 2, b"d")]);
+        let ok = log.append(2, 1, vec![normal(3, 2, b"c"), normal(4, 2, b"d")], 0);
         assert!(ok);
         assert_eq!(log.last_index(), 4);
         assert_eq!(log.last_term(), 2);
@@ -402,6 +394,7 @@ mod tests {
                 normal(3, 2, b"c"),
                 normal(4, 2, b"d"),
             ],
+            0,
         );
         let s = log.slice(2, 3);
         assert_eq!(s.len(), 2);
@@ -423,7 +416,7 @@ mod tests {
     #[test]
     fn matches_sentinel_and_real() {
         let mut log = RaftLog::new();
-        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 2, b"b")]);
+        log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 2, b"b")], 0);
 
         assert!(log.matches(0, 0));
         assert!(log.matches(0, 999));
@@ -444,12 +437,14 @@ mod tests {
                 normal(2, 1, b"b"),
                 normal(3, 1, b"stale"),
             ],
+            0,
         );
 
         let ok = log.append(
             1,
             1,
             vec![normal(2, 2, b"B"), normal(3, 2, b"C"), normal(4, 2, b"D")],
+            0,
         );
         assert!(ok);
         assert_eq!(log.last_index(), 4);

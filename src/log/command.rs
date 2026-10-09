@@ -9,21 +9,8 @@ pub enum LogCommand {
         prev_log_index: u64,
         prev_log_term: u64,
         entries: Vec<LogEntry>,
+        committed: u64,
         reply: oneshot::Sender<bool>,
-    },
-
-    /// delete from (and including) the index from_index.
-    /// return the number of delete items.
-    TruncateFrom {
-        from_index: u64,
-        reply: oneshot::Sender<usize>,
-    },
-
-    /// Retain up to and including the upto_index. and delete the rest.
-    /// return the number of deleted items.
-    TruncateSuffix {
-        upto_index: u64,
-        reply: oneshot::Sender<usize>,
     },
 
     /// get last entry index / term

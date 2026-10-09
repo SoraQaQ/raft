@@ -53,7 +53,7 @@ impl CandidateState {
     }
 
     pub fn is_majority(&self, cluster_size: usize) -> bool {
-        self.count() >= cluster_size / 2 + 1
+        self.count() > cluster_size / 2
     }
 }
 
@@ -145,15 +145,21 @@ impl RaftState {
             }
             RaftRole::Leader => {
                 assert!(
-                    self.leader.is_none(),
+                    self.leader.is_some(),
                     "leader state but leader state is none"
                 );
 
                 assert!(
-                    self.candidate.is_some(),
+                    self.candidate.is_none(),
                     "leader state but candidate is some"
                 );
             }
         }
+    }
+}
+
+impl Default for RaftState {
+    fn default() -> Self {
+        Self::new()
     }
 }

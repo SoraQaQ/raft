@@ -23,18 +23,13 @@ impl LogActor {
                 prev_log_index,
                 prev_log_term,
                 entries,
+                committed,
                 reply,
             } => {
-                let ok = self.log.append(prev_log_index, prev_log_term, entries);
+                let ok = self
+                    .log
+                    .append(prev_log_index, prev_log_term, entries, committed);
                 let _ = reply.send(ok);
-            }
-            LogCommand::TruncateFrom { from_index, reply } => {
-                let removed = self.log.truncate_from(from_index);
-                let _ = reply.send(removed);
-            }
-            LogCommand::TruncateSuffix { upto_index, reply } => {
-                let removed = self.log.truncate_suffix(upto_index);
-                let _ = reply.send(removed);
             }
             LogCommand::LastInfo { reply } => {
                 let _ = reply.send((self.log.last_index(), self.log.last_term()));
@@ -87,6 +82,7 @@ impl LogHandle {
         prev_log_index: u64,
         prev_log_term: u64,
         entires: Vec<LogEntry>,
+        commit_index: u64,
     ) -> bool {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -94,30 +90,7 @@ impl LogHandle {
                 prev_log_index,
                 prev_log_term,
                 entries: entires,
-                reply: reply_tx,
-            })
-            .await
-            .expect("LogActor has shut down");
-        reply_rx.await.expect("LogActor dropped reply")
-    }
-
-    pub async fn truncate_from(&self, from_index: u64) -> usize {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(LogCommand::TruncateFrom {
-                from_index,
-                reply: reply_tx,
-            })
-            .await
-            .expect("LogActor has shut down");
-        reply_rx.await.expect("LogActor dropped reply")
-    }
-
-    pub async fn truncate_suffix(&self, upto_index: u64) -> usize {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(LogCommand::TruncateSuffix {
-                upto_index,
+                committed: commit_index,
                 reply: reply_tx,
             })
             .await
@@ -199,7 +172,7 @@ mod tests {
         assert_eq!(log.last_info().await, (0, 0));
 
         let ok = log
-            .append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")])
+            .append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0)
             .await;
         assert!(ok);
         assert_eq!(log.last_info().await, (2, 1));
@@ -212,11 +185,12 @@ mod tests {
             0,
             0,
             vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+            0,
         )
         .await;
 
         let ok = log
-            .append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")])
+            .append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0)
             .await;
         assert!(ok);
 
@@ -226,27 +200,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_from_actor() {
-        let log = LogHandle::spawn();
-        log.append(
-            0,
-            0,
-            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
-        )
-        .await;
-
-        let removed = log.truncate_from(2).await;
-        assert_eq!(removed, 2);
-        assert_eq!(log.last_info().await, (1, 1));
-    }
-
-    #[tokio::test]
     async fn slice_actor() {
         let log = LogHandle::spawn();
         log.append(
             0,
             0,
             vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+            0,
         )
         .await;
 
@@ -259,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn matches_actor() {
         let log = LogHandle::spawn();
-        log.append(0, 0, vec![normal(1, 1, b"a")]).await;
+        log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
 
         assert!(log.matches(0, 0).await);
         assert!(log.matches(1, 1).await);
@@ -271,7 +231,7 @@ mod tests {
         let log = LogHandle::spawn();
         let log2 = log.clone();
 
-        log.append(0, 0, vec![normal(1, 1, b"a")]).await;
+        log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
         assert_eq!(log2.last_info().await, (1, 1));
     }
 

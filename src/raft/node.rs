@@ -54,7 +54,7 @@ impl RaftNode {
     }
 
     async fn broadcast(&self, msg: RaftMessage) {
-        for (_, tx) in &self.peer_txs {
+        for tx in self.peer_txs.values() {
             let tx = tx.clone();
             let msg = msg.clone();
 
@@ -249,25 +249,20 @@ impl RaftNode {
         leader_commit: u64,
     ) {
         if term < self.state.current_term {
-            let match_index = self.log.last_info().await.0;
             self.send_to(
                 from,
                 RaftMessage::AppendEntiresResp {
                     term: self.state.current_term,
                     success: false,
-                    match_index: match_index,
+                    match_index: 0,
                 },
             )
             .await;
             return;
         }
 
-        if term > self.state.current_term {
+        if term > self.state.current_term || self.state.role != RaftRole::Follower {
             self.become_follower(term);
-        } else {
-            if self.state.role != RaftRole::Follower {
-                self.become_follower(term);
-            }
         }
 
         self.reset_election_timer();
@@ -275,13 +270,12 @@ impl RaftNode {
         let matches = self.log.matches(prev_log_index, prev_log_term).await;
 
         if !matches {
-            let match_index = self.log.last_info().await.0;
             self.send_to(
                 from,
                 RaftMessage::AppendEntiresResp {
                     term: self.state.current_term,
                     success: false,
-                    match_index: match_index,
+                    match_index: 0,
                 },
             )
             .await;
@@ -289,9 +283,47 @@ impl RaftNode {
         }
 
         let entries_len = entries.len() as u64;
-        self.log
-            .append(prev_log_index, prev_log_term, entries)
+
+        // Check log continuity
+        let contiguous = entries
+            .iter()
+            .enumerate()
+            .all(|(i, x)| x.index == prev_log_index + 1 + i as u64);
+
+        if !contiguous {
+            self.send_to(
+                from,
+                RaftMessage::AppendEntiresResp {
+                    term: self.state.current_term,
+                    success: false,
+                    match_index: 0,
+                },
+            )
             .await;
+            return;
+        }
+
+        if !self
+            .log
+            .append(
+                prev_log_index,
+                prev_log_term,
+                entries,
+                self.state.commit_index,
+            )
+            .await
+        {
+            self.send_to(
+                from,
+                RaftMessage::AppendEntiresResp {
+                    term: self.state.current_term,
+                    success: false,
+                    match_index: 0,
+                },
+            )
+            .await;
+            return;
+        }
 
         let last_new_index = prev_log_index + entries_len;
 
@@ -458,11 +490,16 @@ impl RaftNode {
         let new_index = last_index + 1;
         let entry = LogEntry::normal(new_index, self.state.current_term, data);
 
-        let ok = self.log.append(last_index, last_term, vec![entry]).await;
+        let ok = self
+            .log
+            .append(last_index, last_term, vec![entry], self.state.commit_index)
+            .await;
 
         if !ok {
             return ProposeResult::rejected();
         }
+
+        self.maybe_advance_commit().await;
 
         for &peer in &self.peers {
             self.send_append_entries_to(peer).await;
@@ -522,7 +559,7 @@ impl RaftNode {
                         role: self.state.role,
                         term: self.state.current_term,
                         commit_index: self.state.commit_index,
-                        last_index: last_index,
+                        last_index,
                         voted_for: self.state.voted_for,
                     });
                 }
