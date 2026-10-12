@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use anyhow::Error;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendError {
     LogMismatch {
