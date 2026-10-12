@@ -1,8 +1,11 @@
 use tokio::sync::{mpsc, oneshot};
 
-use crate::log::{
-    command::LogCommand,
-    raft_log::{LogEntry, RaftLog},
+use crate::{
+    error::append_error::AppendError,
+    log::{
+        command::LogCommand,
+        raft_log::{LogEntry, RaftLog},
+    },
 };
 
 struct LogActor {
@@ -26,10 +29,10 @@ impl LogActor {
                 committed,
                 reply,
             } => {
-                let ok = self
+                let result = self
                     .log
                     .append(prev_log_index, prev_log_term, entries, committed);
-                let _ = reply.send(ok);
+                let _ = reply.send(result);
             }
             LogCommand::LastInfo { reply } => {
                 let _ = reply.send((self.log.last_index(), self.log.last_term()));
@@ -83,7 +86,7 @@ impl LogHandle {
         prev_log_term: u64,
         entires: Vec<LogEntry>,
         commit_index: u64,
-    ) -> bool {
+    ) -> Result<(), AppendError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(LogCommand::Append {
@@ -171,10 +174,10 @@ mod tests {
         let log = LogHandle::spawn();
         assert_eq!(log.last_info().await, (0, 0));
 
-        let ok = log
+        let result = log
             .append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0)
             .await;
-        assert!(ok);
+        assert!(result.is_ok());
         assert_eq!(log.last_info().await, (2, 1));
     }
 
@@ -189,10 +192,10 @@ mod tests {
         )
         .await;
 
-        let ok = log
+        let result = log
             .append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0)
             .await;
-        assert!(ok);
+        assert!(result.is_ok());
 
         assert_eq!(log.get(2).await.unwrap().term, 2);
         assert_eq!(log.get(3).await.unwrap().term, 2);

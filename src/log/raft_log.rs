@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::error::append_error::AppendError;
+
 // ============================================================
 // LogEntry
 // ============================================================
@@ -146,7 +148,7 @@ impl RaftLog {
     }
 
     /// delete single logs(by index)
-    pub fn remove(&mut self, index: u64) -> Option<LogEntry> {
+    fn remove(&mut self, index: u64) -> Option<LogEntry> {
         if index < self.offset || index > self.last_index() {
             return None;
         }
@@ -171,9 +173,24 @@ impl RaftLog {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         committed: u64,
-    ) -> bool {
+    ) -> Result<(), AppendError> {
         if !self.matches(prev_log_index, prev_log_term) {
-            return false;
+            return Err(AppendError::LogMismatch {
+                prev_log_index,
+                prev_log_term,
+            });
+        }
+
+        if let Some((offset, entry)) = entries
+            .iter()
+            .enumerate()
+            .find(|(i, x)| x.index != prev_log_index + 1 + *i as u64)
+        {
+            return Err(AppendError::NonContiguous {
+                offset: offset as u64,
+                expected: prev_log_index + 1 + offset as u64,
+                got: entry.index,
+            });
         }
 
         // 1. find the first point of conflict
@@ -191,25 +208,20 @@ impl RaftLog {
 
         if let Some(idx) = conflict_at {
             if committed >= idx {
-                return false;
+                return Err(AppendError::OverwriteCommitted {
+                    index: idx,
+                    committed,
+                });
             }
             self.truncate_from(idx);
         }
 
         for entry in entries {
             if entry.index > self.last_index() {
-                debug_assert_eq!(
-                    entry.index,
-                    self.last_index() + 1,
-                    "append gap: excepted{}. got {}",
-                    self.last_index() + 1,
-                    entry.index
-                );
                 self.entries.push(entry);
             }
         }
-
-        true
+        Ok(())
     }
 }
 
@@ -250,8 +262,8 @@ mod tests {
     #[test]
     fn append_from_scratch() {
         let mut log = RaftLog::new();
-        let ok = log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
-        assert!(ok);
+        let result = log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.last_term(), 1);
         assert_eq!(log.get(1).unwrap().data, b"a");
@@ -264,9 +276,23 @@ mod tests {
 
         log.append(0, 0, vec![normal(1, 1, b"a")], 0);
 
-        assert!(!log.append(1, 99, vec![normal(2, 1, b"b")], 0));
+        assert!(
+            log.append(1, 99, vec![normal(2, 1, b"b")], 0)
+                .err()
+                .unwrap()
+                == AppendError::LogMismatch {
+                    prev_log_index: 1,
+                    prev_log_term: 99
+                }
+        );
 
-        assert!(!log.append(5, 1, vec![normal(6, 1, b"b")], 0));
+        assert!(
+            log.append(5, 1, vec![normal(6, 1, b"b")], 0).err().unwrap()
+                == AppendError::LogMismatch {
+                    prev_log_index: 5,
+                    prev_log_term: 1
+                }
+        );
 
         assert_eq!(log.last_index(), 1);
     }
@@ -320,8 +346,14 @@ mod tests {
     fn append_refuses_to_truncate_committed() {
         let mut log = RaftLog::new();
         log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
-        let ok = log.append(1, 1, vec![normal(2, 2, b"b")], 2);
-        assert!(!ok);
+        let result = log.append(1, 1, vec![normal(2, 2, b"b")], 2);
+        assert!(
+            result.err().unwrap()
+                == AppendError::OverwriteCommitted {
+                    index: 2,
+                    committed: 2
+                }
+        );
     }
 
     #[test]
@@ -334,8 +366,8 @@ mod tests {
             0,
         );
 
-        let ok = log.append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0);
-        assert!(ok);
+        let result = log.append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.last_term(), 2);
         assert_eq!(log.get(2).unwrap().data, b"B");
@@ -348,8 +380,8 @@ mod tests {
         let entries = vec![normal(1, 1, b"a"), normal(2, 1, b"b")];
         log.append(0, 0, entries.clone(), 0);
 
-        let ok = log.append(0, 0, entries, 0);
-        assert!(ok);
+        let result = log.append(0, 0, entries, 0);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.len(), 2);
     }
@@ -359,14 +391,14 @@ mod tests {
         let mut log = RaftLog::new();
         log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
 
-        let ok = log.append(
+        let result = log.append(
             1,
             1,
             vec![normal(2, 1, b"b"), normal(3, 1, b"c"), normal(4, 1, b"d")],
             0,
         );
 
-        assert!(ok);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 4);
         assert_eq!(log.len(), 4);
     }
@@ -376,8 +408,8 @@ mod tests {
         let mut log = RaftLog::new();
         log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
 
-        let ok = log.append(2, 1, vec![normal(3, 2, b"c"), normal(4, 2, b"d")], 0);
-        assert!(ok);
+        let result = log.append(2, 1, vec![normal(3, 2, b"c"), normal(4, 2, b"d")], 0);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 4);
         assert_eq!(log.last_term(), 2);
     }
@@ -440,13 +472,13 @@ mod tests {
             0,
         );
 
-        let ok = log.append(
+        let result = log.append(
             1,
             1,
             vec![normal(2, 2, b"B"), normal(3, 2, b"C"), normal(4, 2, b"D")],
             0,
         );
-        assert!(ok);
+        assert!(result.is_ok());
         assert_eq!(log.last_index(), 4);
         assert_eq!(log.get(1).unwrap().term, 1);
         assert_eq!(log.get(2).unwrap().term, 2);

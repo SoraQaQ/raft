@@ -127,7 +127,7 @@ impl RaftNode {
                 self.handle_request_vote(from, term, candidate_id, last_log_index, last_log_term)
                     .await;
             }
-            RaftMessage::AppendEntires {
+            RaftMessage::AppendEntries {
                 term,
                 leader_id,
                 prev_log_index,
@@ -146,7 +146,7 @@ impl RaftNode {
                 )
                 .await;
             }
-            RaftMessage::AppendEntiresResp {
+            RaftMessage::AppendEntriesResp {
                 term,
                 success,
                 match_index,
@@ -249,12 +249,13 @@ impl RaftNode {
         leader_commit: u64,
     ) {
         if term < self.state.current_term {
+            let match_index = self.log.last_info().await.0;
             self.send_to(
                 from,
-                RaftMessage::AppendEntiresResp {
+                RaftMessage::AppendEntriesResp {
                     term: self.state.current_term,
                     success: false,
-                    match_index: 0,
+                    match_index,
                 },
             )
             .await;
@@ -267,43 +268,9 @@ impl RaftNode {
 
         self.reset_election_timer();
 
-        let matches = self.log.matches(prev_log_index, prev_log_term).await;
-
-        if !matches {
-            self.send_to(
-                from,
-                RaftMessage::AppendEntiresResp {
-                    term: self.state.current_term,
-                    success: false,
-                    match_index: 0,
-                },
-            )
-            .await;
-            return;
-        }
-
         let entries_len = entries.len() as u64;
 
-        // Check log continuity
-        let contiguous = entries
-            .iter()
-            .enumerate()
-            .all(|(i, x)| x.index == prev_log_index + 1 + i as u64);
-
-        if !contiguous {
-            self.send_to(
-                from,
-                RaftMessage::AppendEntiresResp {
-                    term: self.state.current_term,
-                    success: false,
-                    match_index: 0,
-                },
-            )
-            .await;
-            return;
-        }
-
-        if !self
+        if let Err(err) = self
             .log
             .append(
                 prev_log_index,
@@ -313,16 +280,24 @@ impl RaftNode {
             )
             .await
         {
+            match &err {
+                crate::error::append_error::AppendError::LogMismatch { .. } => {}
+                crate::error::append_error::AppendError::NonContiguous { .. }
+                | crate::error::append_error::AppendError::OverwriteCommitted { .. } => {
+                    eprintln!("AppendEntries from {from} rejecet {err}");
+                }
+            }
+
+            let (last_index, _) = self.log.last_info().await;
             self.send_to(
                 from,
-                RaftMessage::AppendEntiresResp {
+                RaftMessage::AppendEntriesResp {
                     term: self.state.current_term,
                     success: false,
-                    match_index: 0,
+                    match_index: last_index,
                 },
             )
-            .await;
-            return;
+            .await
         }
 
         let last_new_index = prev_log_index + entries_len;
@@ -336,7 +311,7 @@ impl RaftNode {
 
         self.send_to(
             from,
-            RaftMessage::AppendEntiresResp {
+            RaftMessage::AppendEntriesResp {
                 term: self.state.current_term,
                 success: true,
                 match_index: last_new_index,
@@ -375,8 +350,13 @@ impl RaftNode {
         } else {
             // now sub 1, maybe Optimize
             if let Some(leader) = self.state.as_leader_mut() {
+                let matched = leader.match_index.get(&from).cloned().unwrap_or(0);
                 let new_next = leader.next_index.entry(from).or_insert(1);
-                *new_next = (*new_next).saturating_sub(1).max(1);
+                *new_next = match_index
+                    .saturating_add(1)
+                    .min(new_next.saturating_sub(1))
+                    .max(matched + 1)
+                    .max(1);
             } else {
                 return;
             };
@@ -391,7 +371,7 @@ impl RaftNode {
     /// send heartbeat(empty entries) to all peer
     async fn broadcast_heartbeat(&self) {
         let (last_log_index, last_log_term) = self.log.last_info().await;
-        let msg = RaftMessage::AppendEntires {
+        let msg = RaftMessage::AppendEntries {
             term: self.state.current_term,
             leader_id: self.id,
             prev_log_index: last_log_index,
@@ -465,7 +445,7 @@ impl RaftNode {
 
         self.send_to(
             peer,
-            RaftMessage::AppendEntires {
+            RaftMessage::AppendEntries {
                 term: self.state.current_term,
                 leader_id: self.id,
                 prev_log_index,
@@ -490,12 +470,12 @@ impl RaftNode {
         let new_index = last_index + 1;
         let entry = LogEntry::normal(new_index, self.state.current_term, data);
 
-        let ok = self
+        if self
             .log
             .append(last_index, last_term, vec![entry], self.state.commit_index)
-            .await;
-
-        if !ok {
+            .await
+            .is_err()
+        {
             return ProposeResult::rejected();
         }
 

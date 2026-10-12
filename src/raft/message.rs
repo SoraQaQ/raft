@@ -4,7 +4,7 @@ use crate::{log::raft_log::LogEntry, raft::state::NodeId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftMessage {
-    AppendEntires {
+    AppendEntries {
         term: u64,
         leader_id: NodeId,
         prev_log_index: u64,
@@ -12,7 +12,7 @@ pub enum RaftMessage {
         entries: Vec<LogEntry>,
         leader_commit: u64,
     },
-    AppendEntiresResp {
+    AppendEntriesResp {
         term: u64,
         success: bool,
         match_index: u64,

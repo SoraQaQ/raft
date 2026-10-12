@@ -1,6 +1,6 @@
 use tokio::sync::oneshot;
 
-use crate::log::raft_log::LogEntry;
+use crate::{error::append_error::AppendError, log::raft_log::LogEntry};
 
 pub enum LogCommand {
     /// raft core: append / overwrite logs
@@ -10,7 +10,7 @@ pub enum LogCommand {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         committed: u64,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<(), AppendError>>,
     },
 
     /// get last entry index / term
