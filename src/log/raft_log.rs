@@ -55,55 +55,108 @@ pub struct RaftLog {
     offset: u64,
 }
 
-impl RaftLog {
-    pub fn new() -> Self {
+pub trait Log {
+    fn new() -> Self;
+
+    fn last_index(&self) -> u64;
+
+    /// return last log term, if empty log return 0
+    fn last_term(&self) -> u64;
+
+    fn is_empty(&self) -> bool;
+
+    fn len(&self) -> usize;
+
+    /// retrieve logs using the index
+    fn get(&self, index: u64) -> Option<&LogEntry>;
+
+    /// term at index: index return None if the index out of bounds
+    /// the sentinel at index 0 return 0
+    /// (used for the prev_log_term check)
+    fn term_at(&self, index: u64) -> Option<u64>;
+
+    /// returns the closed interval `[from, to]`
+    /// returns empty if `from > to` or if the range is out of bounds
+    fn slice(&self, from: u64, to: u64) -> Vec<LogEntry>;
+
+    /// Consistency check whether `prev_log_index` / `prev_log_term` match
+    /// `prev_log_index == 0` always matches (sentinel)
+    /// otherwise, the index must match exist locally and ther term must match
+    fn matches(&self, prev_log_index: u64, prev_log_term: u64) -> bool;
+
+    ///Deletes all logs starting from `from_index` (inclusive)
+    /// Returns the number of deleted entries
+    ///
+    /// `from_index < offset` no-op
+    /// `from_index` > last_index: no-op
+    fn truncate_from(&mut self, from_index: u64) -> usize;
+
+    /// delete single logs(by index)
+    fn remove(&mut self, index: u64) -> Option<LogEntry>;
+
+    /// append/overwrite log entries
+    ///
+    /// steps:
+    /// 1. consistency check (`prev_log_index / prev_log_term`); return Err and leave state unchanged if it fails
+    ///
+    /// 2. find the fist point if conflict(local entry has the same index but a different term) and truncate starting from that point
+    ///
+    /// 3. append entries not present locally(idempotent)
+    ///
+    /// 4. check committed index, if truncate idx <= committed return Err
+    ///
+    /// return `Ok` to indicate a successful write
+    fn append(
+        &mut self,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<LogEntry>,
+        committed: u64,
+    ) -> Result<(), AppendError>;
+}
+
+impl Log for RaftLog {
+    fn new() -> Self {
         Self {
             entries: Vec::new(),
             offset: 1,
         }
     }
 
-    pub fn last_index(&self) -> u64 {
+    fn last_index(&self) -> u64 {
         self.entries
             .last()
             .map(|e| e.index)
             .unwrap_or(self.offset - 1)
     }
 
-    /// return last log term, if empty log return 0
-    pub fn last_term(&self) -> u64 {
+    fn last_term(&self) -> u64 {
         self.entries.last().map(|e| e.term).unwrap_or(0)
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// retrieve logs using the index
-    pub fn get(&self, index: u64) -> Option<&LogEntry> {
+    fn get(&self, index: u64) -> Option<&LogEntry> {
         if index < self.offset {
             return None;
         }
         self.entries.get((index - self.offset) as usize)
     }
 
-    /// term at index: index return None if the index out of bounds
-    /// the sentinel at index 0 return 0
-    /// (used for the prev_log_term check)
-    pub fn term_at(&self, index: u64) -> Option<u64> {
+    fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
         }
         self.get(index).map(|e| e.term)
     }
 
-    /// returns the closed interval `[from, to]`
-    /// returns empty if `from > to` or if the range is out of bounds
-    pub fn slice(&self, from: u64, to: u64) -> Vec<LogEntry> {
+    fn slice(&self, from: u64, to: u64) -> Vec<LogEntry> {
         if from > to || from < self.offset {
             return Vec::new();
         }
@@ -117,10 +170,7 @@ impl RaftLog {
         self.entries[start..end].to_vec()
     }
 
-    /// Consistency check whether `prev_log_index` / `prev_log_term` match
-    /// `prev_log_index == 0` always matches (sentinel)
-    /// otherwise, the index must match exist locally and ther term must match
-    pub fn matches(&self, prev_log_index: u64, prev_log_term: u64) -> bool {
+    fn matches(&self, prev_log_index: u64, prev_log_term: u64) -> bool {
         if prev_log_index == 0 {
             return true;
         }
@@ -128,11 +178,6 @@ impl RaftLog {
         matches!(self.get(prev_log_index), Some(e) if e.term == prev_log_term)
     }
 
-    ///Deletes all logs starting from `from_index` (inclusive)
-    /// Returns the number of deleted entries
-    ///
-    /// `from_index < offset` no-op
-    /// `from_index` > last_index: no-op
     fn truncate_from(&mut self, from_index: u64) -> usize {
         if from_index < self.offset {
             return 0;
@@ -147,7 +192,6 @@ impl RaftLog {
         removed
     }
 
-    /// delete single logs(by index)
     fn remove(&mut self, index: u64) -> Option<LogEntry> {
         if index < self.offset || index > self.last_index() {
             return None;
@@ -155,19 +199,7 @@ impl RaftLog {
         Some(self.entries.remove((index - self.offset) as usize))
     }
 
-    /// append/overwrite log entries
-    ///
-    /// steps:
-    /// 1. consistency check (`prev_log_index / prev_log_term`); return Err and leave state unchanged if it fails
-    ///
-    /// 2. find the fist point if conflict(local entry has the same index but a different term) and truncate starting from that point
-    ///
-    /// 3. append entries not present locally(idempotent)
-    ///
-    /// 4. check committed index, if truncate idx <= committed return Err
-    ///
-    /// return `Ok` to indicate a successful write
-    pub fn append(
+    fn append(
         &mut self,
         prev_log_index: u64,
         prev_log_term: u64,

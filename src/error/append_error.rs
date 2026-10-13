@@ -39,7 +39,7 @@ impl Display for AppendError {
             ),
             AppendError::OverwriteCommitted { index, committed } => write!(
                 f,
-                "refusing to overwrite commited entry at index {index}(committed {committed})"
+                "refusing to overwrite committed entry at index {index}(committed {committed})"
             ),
         }
     }

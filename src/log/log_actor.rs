@@ -4,7 +4,7 @@ use crate::{
     error::append_error::AppendError,
     log::{
         command::LogCommand,
-        raft_log::{LogEntry, RaftLog},
+        raft_log::{Log, LogEntry, RaftLog},
     },
 };
 
@@ -184,13 +184,14 @@ mod tests {
     #[tokio::test]
     async fn append_conflict_overwrites() {
         let log = LogHandle::spawn();
-        log.append(
-            0,
-            0,
-            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
-            0,
-        )
-        .await;
+        let _ = log
+            .append(
+                0,
+                0,
+                vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+                0,
+            )
+            .await;
 
         let result = log
             .append(1, 1, vec![normal(2, 2, b"B"), normal(3, 2, b"C")], 0)
@@ -205,13 +206,14 @@ mod tests {
     #[tokio::test]
     async fn slice_actor() {
         let log = LogHandle::spawn();
-        log.append(
-            0,
-            0,
-            vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
-            0,
-        )
-        .await;
+        let _ = log
+            .append(
+                0,
+                0,
+                vec![normal(1, 1, b"a"), normal(2, 1, b"b"), normal(3, 1, b"c")],
+                0,
+            )
+            .await;
 
         let s = log.slice(1, 2).await;
         assert_eq!(s.len(), 2);
@@ -222,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn matches_actor() {
         let log = LogHandle::spawn();
-        log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
+        let _ = log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
 
         assert!(log.matches(0, 0).await);
         assert!(log.matches(1, 1).await);
@@ -234,7 +236,7 @@ mod tests {
         let log = LogHandle::spawn();
         let log2 = log.clone();
 
-        log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
+        let _ = log.append(0, 0, vec![normal(1, 1, b"a")], 0).await;
         assert_eq!(log2.last_info().await, (1, 1));
     }
 
