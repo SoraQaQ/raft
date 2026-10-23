@@ -13,12 +13,6 @@ pub enum NodeCommand {
         reply: oneshot::Sender<ProposeResult>,
     },
 
-    ElectionTick,
-
-    HeartbeatTick,
-
-    ResetElectionTimer,
-
     Inspect {
         reply: oneshot::Sender<InspectResult>,
     },

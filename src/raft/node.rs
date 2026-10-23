@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
+use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -12,6 +14,15 @@ use crate::{
     },
 };
 
+/// Clock granularity. Followers count ticks for the election timeout,
+/// the leader sends one heartbeat per tick.
+const TICK_MS: u64 = 100;
+
+/// Election timeout is randomized in this range (in ticks), so nodes
+/// that start at the same time do not split the vote forever.
+const ELECTION_TIMEOUT_MIN_TICKS: u32 = 5; // 500ms
+const ELECTION_TIMEOUT_MAX_TICKS: u32 = 10; // 1s
+
 pub struct RaftNode {
     id: NodeId,
     peers: Vec<NodeId>,
@@ -19,6 +30,12 @@ pub struct RaftNode {
     state: RaftState,
     log: LogHandle,
     peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
+
+    /// Ticks elapsed since the last reset. Only meaningful when not leader:
+    /// leader ignores the election countdown, followers/candidates ignore
+    /// the heartbeat cadence, so one counter is enough.
+    timer_elapsed: u32,
+    election_timeout: u32,
 }
 
 impl RaftNode {
@@ -28,12 +45,16 @@ impl RaftNode {
         log: LogHandle,
         peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
     ) -> Self {
+        let mut rng = rand::thread_rng();
         Self {
             id,
             peers,
             state: RaftState::new(),
             log,
             peer_txs,
+            timer_elapsed: 0,
+            election_timeout: rng
+                .gen_range(ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS),
         }
     }
 
@@ -75,7 +96,7 @@ impl RaftNode {
 
     fn become_follower(&mut self, term: u64) {
         self.state.become_follower(term);
-        self.reset_election_timer();
+        self.reset_timer();
     }
 
     async fn become_candidate(&mut self) {
@@ -90,14 +111,14 @@ impl RaftNode {
         };
         self.broadcast(msg).await;
         self.check_election_won().await;
-        self.reset_election_timer();
+        self.reset_timer();
     }
 
     async fn become_leader(&mut self) {
         let last_log_index = self.log.last_info().await.0;
         self.state.become_leader(&self.peers, last_log_index);
         self.broadcast_heartbeat().await;
-        self.reset_election_timer();
+        self.reset_timer();
     }
 
     ///check election won
@@ -198,7 +219,7 @@ impl RaftNode {
             if up_to_date {
                 grant = true;
                 self.state.voted_for = Some(candidate_id);
-                self.reset_election_timer();
+                self.reset_timer();
             }
         }
 
@@ -266,7 +287,7 @@ impl RaftNode {
             self.become_follower(term);
         }
 
-        self.reset_election_timer();
+        self.reset_timer();
 
         let entries_len = entries.len() as u64;
 
@@ -297,7 +318,8 @@ impl RaftNode {
                     match_index: last_index,
                 },
             )
-            .await
+            .await;
+            return;
         }
 
         let last_new_index = prev_log_index + entries_len;
@@ -492,22 +514,25 @@ impl RaftNode {
     // Timer
     // ========================================================
 
-    fn reset_election_timer(&self) {
-        unimplemented!();
+    /// Restart the countdown and pick a fresh random election timeout.
+    fn reset_timer(&mut self) {
+        self.timer_elapsed = 0;
+        self.election_timeout =
+            rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS);
     }
 
-    async fn handle_election_tick(&mut self) {
+    /// One clock tick: the leader sends heartbeats, everyone else runs
+    /// the election countdown.
+    async fn handle_tick(&mut self) {
         if self.is_leader() {
+            self.broadcast_heartbeat().await;
             return;
         }
-        self.become_candidate().await;
-    }
 
-    async fn handle_heartbeat_tick(&mut self) {
-        if !self.is_leader() {
-            return;
+        self.timer_elapsed += 1;
+        if self.timer_elapsed >= self.election_timeout {
+            self.become_candidate().await;
         }
-        self.broadcast_heartbeat().await;
     }
 
     // ========================================================
@@ -515,33 +540,35 @@ impl RaftNode {
     // ========================================================
 
     pub async fn run(mut self, mut rx: mpsc::Receiver<NodeCommand>) {
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                NodeCommand::Raft { from, msg } => {
-                    self.handle_raft(from, msg).await;
+        let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MS));
+        ticker.tick().await; // the first tick of `interval` is immediately ready
+
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { break };
+                    match cmd {
+                        NodeCommand::Raft { from, msg } => {
+                            self.handle_raft(from, msg).await;
+                        }
+                        NodeCommand::ClientPropose { data, reply } => {
+                            let result = self.handle_propose(data).await;
+                            let _ = reply.send(result);
+                        }
+                        NodeCommand::Inspect { reply } => {
+                            let (last_index, _) = self.log.last_info().await;
+                            let _ = reply.send(InspectResult {
+                                role: self.state.role,
+                                term: self.state.current_term,
+                                commit_index: self.state.commit_index,
+                                last_index,
+                                voted_for: self.state.voted_for,
+                            });
+                        }
+                    }
                 }
-                NodeCommand::ClientPropose { data, reply } => {
-                    let result = self.handle_propose(data).await;
-                    let _ = reply.send(result);
-                }
-                NodeCommand::ElectionTick => {
-                    self.handle_election_tick().await;
-                }
-                NodeCommand::HeartbeatTick => {
-                    self.handle_heartbeat_tick().await;
-                }
-                NodeCommand::ResetElectionTimer => {
-                    self.reset_election_timer();
-                }
-                NodeCommand::Inspect { reply } => {
-                    let (last_index, _) = self.log.last_info().await;
-                    let _ = reply.send(InspectResult {
-                        role: self.state.role,
-                        term: self.state.current_term,
-                        commit_index: self.state.commit_index,
-                        last_index,
-                        voted_for: self.state.voted_for,
-                    });
+                _ = ticker.tick() => {
+                    self.handle_tick().await;
                 }
             }
         }
@@ -597,5 +624,149 @@ impl NodeHandle {
             last_index: 0,
             voted_for: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use super::{ELECTION_TIMEOUT_MAX_TICKS, ELECTION_TIMEOUT_MIN_TICKS, RaftNode};
+    use crate::{
+        log::log_actor::LogHandle,
+        raft::{message::RaftMessage, role::RaftRole},
+    };
+
+    fn new_node(peers: Vec<u64>, peer_txs: HashMap<u64, mpsc::Sender<RaftMessage>>) -> RaftNode {
+        RaftNode::new(1, peers, LogHandle::spawn(), peer_txs)
+    }
+
+    /// Run one election round without any clock: drive `handle_tick` by hand.
+    async fn campaign(node: &mut RaftNode) {
+        for _ in 0..node.election_timeout {
+            node.handle_tick().await;
+        }
+    }
+
+    async fn recv(rx: &mut mpsc::Receiver<RaftMessage>) -> Option<RaftMessage> {
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn drain(rx: &mut mpsc::Receiver<RaftMessage>) {
+        while tokio::time::timeout(Duration::from_millis(20), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {}
+    }
+
+    #[tokio::test]
+    async fn initial_timeout_in_range() {
+        let node = new_node(vec![2, 3], HashMap::new());
+        assert!(
+            (ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS)
+                .contains(&node.election_timeout)
+        );
+        assert_eq!(node.timer_elapsed, 0);
+    }
+
+    #[tokio::test]
+    async fn follower_becomes_candidate_after_timeout() {
+        let mut node = new_node(vec![2, 3], HashMap::new());
+
+        for _ in 0..node.election_timeout - 1 {
+            node.handle_tick().await;
+        }
+        assert_eq!(node.state.role, RaftRole::Follower);
+        assert_eq!(node.timer_elapsed, node.election_timeout - 1);
+
+        node.handle_tick().await;
+        assert_eq!(node.state.role, RaftRole::Candidate);
+        assert_eq!(node.state.current_term, 1);
+        assert_eq!(node.state.voted_for, Some(1));
+        assert_eq!(node.timer_elapsed, 0, "a campaign restarts the countdown");
+    }
+
+    #[tokio::test]
+    async fn single_node_wins_immediately() {
+        let mut node = new_node(vec![], HashMap::new());
+        campaign(&mut node).await;
+
+        assert_eq!(node.state.role, RaftRole::Leader);
+        assert_eq!(node.state.current_term, 1);
+    }
+
+    #[tokio::test]
+    async fn candidate_re_campaigns_after_timeout() {
+        let mut node = new_node(vec![2, 3], HashMap::new());
+        campaign(&mut node).await;
+        assert_eq!(node.state.role, RaftRole::Candidate);
+        assert_eq!(node.state.current_term, 1);
+
+        campaign(&mut node).await;
+        assert_eq!(node.state.role, RaftRole::Candidate);
+        assert_eq!(node.state.current_term, 2);
+        assert_eq!(node.state.voted_for, Some(1));
+        assert_eq!(node.state.as_candidate().unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn leader_does_not_run_election_timer() {
+        let mut node = new_node(vec![], HashMap::new());
+        campaign(&mut node).await;
+        assert_eq!(node.state.role, RaftRole::Leader);
+        let term = node.state.current_term;
+
+        for _ in 0..(ELECTION_TIMEOUT_MAX_TICKS * 3) {
+            node.handle_tick().await;
+        }
+        assert_eq!(node.state.role, RaftRole::Leader);
+        assert_eq!(node.state.current_term, term);
+    }
+
+    #[tokio::test]
+    async fn append_entries_resets_countdown() {
+        let mut node = new_node(vec![2, 3], HashMap::new());
+        for _ in 0..node.election_timeout - 1 {
+            node.handle_tick().await;
+        }
+
+        node.handle_append_entries(2, 1, 2, 0, 0, vec![], 0).await;
+        assert_eq!(node.state.role, RaftRole::Follower);
+        assert_eq!(node.state.current_term, 1);
+        assert_eq!(node.timer_elapsed, 0);
+        assert!(
+            (ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS)
+                .contains(&node.election_timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_broadcasts_heartbeat_every_tick() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert(2, tx);
+        let mut node = new_node(vec![2], peer_txs);
+
+        campaign(&mut node).await;
+        assert_eq!(node.state.role, RaftRole::Candidate);
+
+        let term = node.state.current_term;
+        node.handle_request_vote_resp(2, term, true).await;
+        assert_eq!(node.state.role, RaftRole::Leader);
+        drain(&mut rx).await; // drop the heartbeat sent on election
+
+        for _ in 0..3 {
+            node.handle_tick().await;
+            let msg = recv(&mut rx).await;
+            assert!(matches!(msg, Some(RaftMessage::AppendEntries { .. })));
+        }
     }
 }
