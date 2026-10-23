@@ -8,7 +8,7 @@ use crate::{
     log::{log_actor::LogHandle, raft_log::LogEntry},
     raft::{
         command::{InspectResult, NodeCommand, ProposeResult},
-        message::RaftMessage,
+        message::{PeerMessage, RaftMessage},
         role::RaftRole,
         state::{NodeId, RaftState},
     },
@@ -29,7 +29,7 @@ pub struct RaftNode {
 
     state: RaftState,
     log: LogHandle,
-    peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
+    peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
 
     /// Ticks elapsed since the last reset. Only meaningful when not leader:
     /// leader ignores the election countdown, followers/candidates ignore
@@ -43,7 +43,7 @@ impl RaftNode {
         id: NodeId,
         peers: Vec<NodeId>,
         log: LogHandle,
-        peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
+        peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
     ) -> Self {
         let mut rng = rand::thread_rng();
         Self {
@@ -77,7 +77,7 @@ impl RaftNode {
     async fn broadcast(&self, msg: RaftMessage) {
         for tx in self.peer_txs.values() {
             let tx = tx.clone();
-            let msg = msg.clone();
+            let msg = (self.id, msg.clone());
 
             tokio::spawn(async move {
                 let _ = tx.send(msg).await;
@@ -88,6 +88,7 @@ impl RaftNode {
     async fn send_to(&self, to: NodeId, msg: RaftMessage) {
         if let Some(tx) = self.peer_txs.get(&to) {
             let tx = tx.clone();
+            let msg = (self.id, msg);
             tokio::spawn(async move {
                 let _ = tx.send(msg).await;
             });
@@ -115,9 +116,29 @@ impl RaftNode {
     }
 
     async fn become_leader(&mut self) {
-        let last_log_index = self.log.last_info().await.0;
+        let (last_log_index, last_log_term) = self.log.last_info().await;
+
+        // Commit an entry from the new term so entries left over from previous
+        // terms can be committed as well (Raft §5.4.2). Without it an idle
+        // cluster would never advance commit_index after a leader change.
+        let noop = LogEntry::empty(last_log_index + 1, self.state.current_term);
+        let _ = self
+            .log
+            .append(
+                last_log_index,
+                last_log_term,
+                vec![noop],
+                self.state.commit_index,
+            )
+            .await;
+
+        // `last_log_index` points just before the no-op, so every peer's
+        // next_index starts at the no-op and the sends below ship it.
         self.state.become_leader(&self.peers, last_log_index);
-        self.broadcast_heartbeat().await;
+        self.maybe_advance_commit().await;
+        for &peer in &self.peers {
+            self.send_append_entries_to(peer).await;
+        }
         self.reset_timer();
     }
 
@@ -575,6 +596,7 @@ impl RaftNode {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeHandle {
     pub id: NodeId,
     tx: mpsc::Sender<NodeCommand>,
@@ -585,7 +607,7 @@ impl NodeHandle {
         id: NodeId,
         peers: Vec<NodeId>,
         log: LogHandle,
-        peer_txs: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
+        peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         let node = RaftNode::new(id, peers, log, peer_txs);
@@ -637,10 +659,13 @@ mod tests {
     use super::{ELECTION_TIMEOUT_MAX_TICKS, ELECTION_TIMEOUT_MIN_TICKS, RaftNode};
     use crate::{
         log::log_actor::LogHandle,
-        raft::{message::RaftMessage, role::RaftRole},
+        raft::{
+            message::{PeerMessage, RaftMessage},
+            role::RaftRole,
+        },
     };
 
-    fn new_node(peers: Vec<u64>, peer_txs: HashMap<u64, mpsc::Sender<RaftMessage>>) -> RaftNode {
+    fn new_node(peers: Vec<u64>, peer_txs: HashMap<u64, mpsc::Sender<PeerMessage>>) -> RaftNode {
         RaftNode::new(1, peers, LogHandle::spawn(), peer_txs)
     }
 
@@ -651,14 +676,14 @@ mod tests {
         }
     }
 
-    async fn recv(rx: &mut mpsc::Receiver<RaftMessage>) -> Option<RaftMessage> {
+    async fn recv(rx: &mut mpsc::Receiver<PeerMessage>) -> Option<PeerMessage> {
         tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .ok()
             .flatten()
     }
 
-    async fn drain(rx: &mut mpsc::Receiver<RaftMessage>) {
+    async fn drain(rx: &mut mpsc::Receiver<PeerMessage>) {
         while tokio::time::timeout(Duration::from_millis(20), rx.recv())
             .await
             .ok()
@@ -701,6 +726,25 @@ mod tests {
 
         assert_eq!(node.state.role, RaftRole::Leader);
         assert_eq!(node.state.current_term, 1);
+
+        // the leader appended a no-op and, being the whole cluster, committed it
+        assert_eq!(node.log.last_info().await, (1, 1));
+        assert_eq!(node.state.commit_index, 1);
+    }
+
+    #[tokio::test]
+    async fn leader_appends_noop_entry() {
+        let mut node = new_node(vec![2, 3], HashMap::new());
+        campaign(&mut node).await;
+        let term = node.state.current_term;
+
+        node.handle_request_vote_resp(2, term, true).await;
+        assert_eq!(node.state.role, RaftRole::Leader);
+
+        let (last_index, last_term) = node.log.last_info().await;
+        assert_eq!(last_index, 1);
+        assert_eq!(last_term, term);
+        assert!(node.log.get(1).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -766,7 +810,7 @@ mod tests {
         for _ in 0..3 {
             node.handle_tick().await;
             let msg = recv(&mut rx).await;
-            assert!(matches!(msg, Some(RaftMessage::AppendEntries { .. })));
+            assert!(matches!(msg, Some((1, RaftMessage::AppendEntries { .. }))));
         }
     }
 }

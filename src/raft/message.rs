@@ -30,3 +30,8 @@ pub enum RaftMessage {
         vote_granted: bool,
     },
 }
+
+/// A raft message tagged with the sender's id at the transport boundary.
+/// Responses carry no sender in their payload, so a per-node inbox needs
+/// this to attribute votes and replication progress to the right peer.
+pub type PeerMessage = (NodeId, RaftMessage);
