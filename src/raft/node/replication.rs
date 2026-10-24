@@ -55,7 +55,7 @@ impl RaftNode {
             match &err {
                 AppendError::LogMismatch { .. } => {}
                 AppendError::NonContiguous { .. } | AppendError::OverwriteCommitted { .. } => {
-                    eprintln!("AppendEntries from {from} rejecet {err}");
+                    eprintln!("AppendEntries from {from} rejected {err}");
                 }
             }
 

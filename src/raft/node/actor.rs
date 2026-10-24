@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    error::query_error::QueryError,
     log::log_actor::LogHandle,
     raft::{
         command::{InspectResult, NodeCommand, ProposeResult},
@@ -81,6 +82,9 @@ impl RaftNode {
                             let result = self.handle_propose(data).await;
                             let _ = reply.send(result);
                         }
+                        NodeCommand::QueryLocal { request, reply } => {
+                            let _ = reply.send(self.state_machine.query(&request));
+                        }
                         NodeCommand::Inspect { reply } => {
                             let (last_index, _) = self.log.last_info().await;
                             let _ = reply.send(InspectResult {
@@ -146,6 +150,22 @@ impl NodeHandle {
         reply_rx.await.unwrap_or_else(|_| ProposeResult::rejected())
     }
 
+    /// Read this node's applied state without contacting peers.
+    /// May return stale data on any node, including a leader.
+    /// Returns an error if the node cannot receive or answer the query.
+    pub async fn query_local(&self, request: Vec<u8>) -> Result<Vec<u8>, QueryError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(NodeCommand::QueryLocal {
+                request,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| QueryError::NodeUnavailable)?;
+
+        reply_rx.await.map_err(|_| QueryError::ResponseDropped)
+    }
+
     pub async fn inspect(&self) -> InspectResult {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.tx.send(NodeCommand::Inspect { reply: reply_tx }).await;
@@ -158,5 +178,34 @@ impl NodeHandle {
             last_applied: 0,
             voted_for: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn query_local_errors_when_node_is_unavailable() {
+        let (tx, rx) = mpsc::channel(1);
+        let handle = NodeHandle { id: 1, tx };
+        drop(rx);
+
+        assert_eq!(
+            handle.query_local(b"k".to_vec()).await,
+            Err(QueryError::NodeUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn query_local_errors_when_reply_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = NodeHandle { id: 1, tx };
+
+        let (result, ()) = tokio::join!(handle.query_local(b"k".to_vec()), async {
+            drop(rx.recv().await.unwrap());
+        });
+
+        assert_eq!(result, Err(QueryError::ResponseDropped));
     }
 }

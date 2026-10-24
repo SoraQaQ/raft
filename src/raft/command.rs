@@ -13,6 +13,11 @@ pub enum NodeCommand {
         reply: oneshot::Sender<ProposeResult>,
     },
 
+    QueryLocal {
+        request: Vec<u8>,
+        reply: oneshot::Sender<Vec<u8>>,
+    },
+
     Inspect {
         reply: oneshot::Sender<InspectResult>,
     },

@@ -309,23 +309,22 @@ mod tests {
         let result = log.append(0, 0, vec![normal(1, 1, b"a")], 0);
         assert!(result.is_ok());
 
-        assert!(
-            log.append(1, 99, vec![normal(2, 1, b"b")], 0)
-                .err()
-                .unwrap()
-                == AppendError::LogMismatch {
-                    prev_log_index: 1,
-                    prev_log_term: 99
-                }
+        assert_eq!(
+            log.append(1, 99, vec![normal(2, 1, b"b")], 0).unwrap_err(),
+            AppendError::LogMismatch {
+                prev_log_index: 1,
+                prev_log_term: 99,
+            }
         );
 
-        assert!(
-            log.append(5, 1, vec![normal(6, 1, b"b")], 0).err().unwrap()
-                == AppendError::LogMismatch {
-                    prev_log_index: 5,
-                    prev_log_term: 1
-                }
+        assert_eq!(
+            log.append(5, 1, vec![normal(6, 1, b"b")], 0).unwrap_err(),
+            AppendError::LogMismatch {
+                prev_log_index: 5,
+                prev_log_term: 1,
+            }
         );
+        assert_eq!(log.entries, vec![normal(1, 1, b"a")]);
 
         assert_eq!(log.last_index(), 1);
     }
@@ -385,13 +384,34 @@ mod tests {
         let reesult = log.append(0, 0, vec![normal(1, 1, b"a"), normal(2, 1, b"b")], 0);
         assert!(reesult.is_ok());
         let result = log.append(1, 1, vec![normal(2, 2, b"b")], 2);
-        assert!(
-            result.err().unwrap()
-                == AppendError::OverwriteCommitted {
-                    index: 2,
-                    committed: 2
-                }
+        assert_eq!(
+            result.unwrap_err(),
+            AppendError::OverwriteCommitted {
+                index: 2,
+                committed: 2,
+            }
         );
+        assert_eq!(log.entries, vec![normal(1, 1, b"a"), normal(2, 1, b"b")]);
+    }
+
+    #[test]
+    fn append_rejects_non_contiguous_entries_without_changes() {
+        let mut log = RaftLog::new();
+        let entries = vec![normal(1, 1, b"a"), normal(2, 1, b"b")];
+        log.append(0, 0, entries.clone(), 0).unwrap();
+
+        let error = log
+            .append(1, 1, vec![normal(2, 2, b"B"), normal(4, 2, b"D")], 0)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AppendError::NonContiguous {
+                offset: 1,
+                expected: 3,
+                got: 4,
+            }
+        );
+        assert_eq!(log.entries, entries);
     }
 
     #[test]

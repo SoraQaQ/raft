@@ -163,7 +163,10 @@ impl LogHandle {
 
 #[cfg(test)]
 mod tests {
-    use crate::log::{log_actor::LogHandle, raft_log::LogEntry};
+    use crate::{
+        error::append_error::AppendError,
+        log::{log_actor::LogHandle, raft_log::LogEntry},
+    };
 
     fn normal(i: u64, t: u64, s: &[u8]) -> LogEntry {
         LogEntry::normal(i, t, s.to_vec())
@@ -201,6 +204,55 @@ mod tests {
         assert_eq!(log.get(2).await.unwrap().term, 2);
         assert_eq!(log.get(3).await.unwrap().term, 2);
         assert_eq!(log.last_info().await, (3, 2));
+    }
+
+    #[tokio::test]
+    async fn append_preserves_concrete_errors_and_entries() {
+        let log = LogHandle::spawn();
+        let entries = vec![normal(1, 1, b"a"), normal(2, 1, b"b")];
+        log.append(0, 0, entries.clone(), 0).await.unwrap();
+
+        let cases = [
+            (
+                1,
+                99,
+                vec![normal(2, 2, b"B")],
+                0,
+                AppendError::LogMismatch {
+                    prev_log_index: 1,
+                    prev_log_term: 99,
+                },
+            ),
+            (
+                1,
+                1,
+                vec![normal(2, 2, b"B"), normal(4, 2, b"D")],
+                0,
+                AppendError::NonContiguous {
+                    offset: 1,
+                    expected: 3,
+                    got: 4,
+                },
+            ),
+            (
+                1,
+                1,
+                vec![normal(2, 2, b"B")],
+                2,
+                AppendError::OverwriteCommitted {
+                    index: 2,
+                    committed: 2,
+                },
+            ),
+        ];
+        for (prev_index, prev_term, incoming, committed, expected) in cases {
+            let error = log
+                .append(prev_index, prev_term, incoming, committed)
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(log.slice(1, 2).await, entries);
+        }
     }
 
     #[tokio::test]
