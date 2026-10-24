@@ -31,7 +31,7 @@ impl RaftNode {
                 vote_granted: false,
             };
 
-            self.send_to(from, msg).await;
+            self.send_to(from, msg);
             return;
         }
 
@@ -61,8 +61,7 @@ impl RaftNode {
                 term: self.state.current_term,
                 vote_granted: grant,
             },
-        )
-        .await;
+        );
     }
 
     pub(super) async fn handle_request_vote_resp(

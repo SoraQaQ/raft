@@ -46,5 +46,6 @@ pub struct InspectResult {
     pub term: u64,
     pub commit_index: u64,
     pub last_index: u64,
+    pub last_applied: u64,
     pub voted_for: Option<NodeId>,
 }

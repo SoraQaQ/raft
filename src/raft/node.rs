@@ -14,9 +14,11 @@ use crate::{
         role::RaftRole,
         state::{NodeId, RaftState},
     },
+    state_machine::StateMachine,
 };
 
 mod actor;
+mod apply;
 mod client;
 mod election;
 mod replication;
@@ -43,6 +45,7 @@ pub struct RaftNode {
     state: RaftState,
     log: LogHandle,
     peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
+    state_machine: Box<dyn StateMachine>,
 
     /// Ticks elapsed since the last reset. Only meaningful when not leader:
     /// leader ignores the election countdown, followers/candidates ignore
@@ -57,6 +60,7 @@ impl RaftNode {
         peers: Vec<NodeId>,
         log: LogHandle,
         peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
+        state_machine: Box<dyn StateMachine>,
     ) -> Self {
         let mut rng = rand::thread_rng();
         Self {
@@ -65,6 +69,7 @@ impl RaftNode {
             state: RaftState::new(),
             log,
             peer_txs,
+            state_machine,
             timer_elapsed: 0,
             election_timeout: rng
                 .gen_range(ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS),
@@ -87,7 +92,7 @@ impl RaftNode {
         self.state.role == RaftRole::Candidate
     }
 
-    async fn broadcast(&self, msg: RaftMessage) {
+    fn broadcast(&self, msg: RaftMessage) {
         for tx in self.peer_txs.values() {
             let tx = tx.clone();
             let msg = (self.id, msg.clone());
@@ -98,7 +103,7 @@ impl RaftNode {
         }
     }
 
-    async fn send_to(&self, to: NodeId, msg: RaftMessage) {
+    fn send_to(&self, to: NodeId, msg: RaftMessage) {
         if let Some(tx) = self.peer_txs.get(&to) {
             let tx = tx.clone();
             let msg = (self.id, msg);
@@ -123,7 +128,7 @@ impl RaftNode {
             last_log_index,
             last_log_term,
         };
-        self.broadcast(msg).await;
+        self.broadcast(msg);
         self.check_election_won().await;
         self.reset_timer();
     }
@@ -149,7 +154,7 @@ impl RaftNode {
         // next_index starts at the no-op and the sends below ship it.
         self.state.become_leader(&self.peers, last_log_index);
         self.maybe_advance_commit().await;
-        for &peer in &self.peers {
+        for peer in self.peers.clone() {
             self.send_append_entries_to(peer).await;
         }
         self.reset_timer();

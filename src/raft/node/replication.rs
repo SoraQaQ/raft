@@ -30,8 +30,7 @@ impl RaftNode {
                     success: false,
                     match_index,
                 },
-            )
-            .await;
+            );
             return;
         }
 
@@ -68,8 +67,7 @@ impl RaftNode {
                     success: false,
                     match_index: last_index,
                 },
-            )
-            .await;
+            );
             return;
         }
 
@@ -79,7 +77,6 @@ impl RaftNode {
         if leader_commit > self.state.commit_index {
             let new_commit_index = leader_commit.min(last_new_index);
             self.state.commit_index = self.state.commit_index.max(new_commit_index);
-            //TODO: apply log
         }
 
         self.send_to(
@@ -89,8 +86,7 @@ impl RaftNode {
                 success: true,
                 match_index: last_new_index,
             },
-        )
-        .await;
+        );
     }
 
     /// Received AppendEntriesResp (leader).
@@ -142,7 +138,7 @@ impl RaftNode {
     // ========================================================
 
     /// Send a heartbeat (empty entries) to every peer.
-    pub(super) async fn broadcast_heartbeat(&self) {
+    pub(super) async fn broadcast_heartbeat(&mut self) {
         let (last_log_index, last_log_term) = self.log.last_info().await;
         let msg = RaftMessage::AppendEntries {
             term: self.state.current_term,
@@ -152,7 +148,7 @@ impl RaftNode {
             entries: vec![],
             leader_commit: self.state.commit_index,
         };
-        self.broadcast(msg).await;
+        self.broadcast(msg);
     }
 
     /// Try to advance commit_index according to the majority.
@@ -184,12 +180,11 @@ impl RaftNode {
         }
 
         self.state.commit_index = majority_index;
-        //TODO: apply log
     }
 
     /// Send AppendEntries to a single peer, deciding what to send based on its
     /// next_index.
-    pub(super) async fn send_append_entries_to(&self, peer: NodeId) {
+    pub(super) async fn send_append_entries_to(&mut self, peer: NodeId) {
         let next_index = match self.state.as_leader() {
             Some(l) => match l.next_index.get(&peer) {
                 Some(&n) => n,
@@ -227,7 +222,6 @@ impl RaftNode {
                 entries,
                 leader_commit: self.state.commit_index,
             },
-        )
-        .await;
+        );
     }
 }

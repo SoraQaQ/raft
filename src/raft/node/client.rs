@@ -25,7 +25,7 @@ impl RaftNode {
 
         self.maybe_advance_commit().await;
 
-        for &peer in &self.peers {
+        for peer in self.peers.clone() {
             self.send_append_entries_to(peer).await;
         }
 

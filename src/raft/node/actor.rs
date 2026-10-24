@@ -14,6 +14,7 @@ use crate::{
         role::RaftRole,
         state::NodeId,
     },
+    state_machine::StateMachine,
 };
 
 use super::{RaftNode, TICK_MS};
@@ -87,6 +88,7 @@ impl RaftNode {
                                 term: self.state.current_term,
                                 commit_index: self.state.commit_index,
                                 last_index,
+                                last_applied: self.state.last_applied,
                                 voted_for: self.state.voted_for,
                             });
                         }
@@ -96,6 +98,10 @@ impl RaftNode {
                     self.handle_tick().await;
                 }
             }
+
+            // Apply after every command so commit progress is visible to the
+            // next command (including reads) without extra bookkeeping.
+            self.advance_apply().await;
         }
     }
 }
@@ -112,9 +118,10 @@ impl NodeHandle {
         peers: Vec<NodeId>,
         log: LogHandle,
         peer_txs: HashMap<NodeId, mpsc::Sender<PeerMessage>>,
+        state_machine: Box<dyn StateMachine>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1024);
-        let node = RaftNode::new(id, peers, log, peer_txs);
+        let node = RaftNode::new(id, peers, log, peer_txs, state_machine);
         tokio::spawn(node.run(rx));
         Self { id, tx }
     }
@@ -148,6 +155,7 @@ impl NodeHandle {
             term: 0,
             commit_index: 0,
             last_index: 0,
+            last_applied: 0,
             voted_for: None,
         })
     }

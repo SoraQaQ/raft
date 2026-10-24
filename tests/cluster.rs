@@ -6,6 +6,7 @@ use raft::raft::command::InspectResult;
 use raft::raft::message::PeerMessage;
 use raft::raft::node::NodeHandle;
 use raft::raft::role::RaftRole;
+use raft::state_machine::KvStateMachine;
 use tokio::sync::mpsc;
 
 const ELECTION_DEADLINE: Duration = Duration::from_secs(10);
@@ -37,7 +38,13 @@ impl Cluster {
             let peer_txs = peers.iter().map(|&p| (p, senders[&p].clone())).collect();
             handles.insert(
                 id,
-                NodeHandle::spawn(id, peers, LogHandle::spawn(), peer_txs),
+                NodeHandle::spawn(
+                    id,
+                    peers,
+                    LogHandle::spawn(),
+                    peer_txs,
+                    Box::new(KvStateMachine::default()),
+                ),
             );
         }
 
@@ -106,6 +113,28 @@ impl Cluster {
             tokio::time::sleep(POLL).await;
         }
     }
+
+    async fn wait_until_applied(&self, index: u64) {
+        let deadline = tokio::time::Instant::now() + COMMIT_DEADLINE;
+        loop {
+            let mut applied = 0;
+            for &id in self.handles.keys() {
+                if self.inspect(id).await.last_applied >= index {
+                    applied += 1;
+                }
+            }
+            if applied == self.handles.len() {
+                return;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "index {index} not applied on every node: {applied}/{}",
+                self.handles.len()
+            );
+            tokio::time::sleep(POLL).await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -131,4 +160,14 @@ async fn replicates_a_client_proposal() {
     let result = cluster.handles[&leader_id].propose(b"hello".to_vec()).await;
     assert!(result.accepted, "propose rejected: {result:?}");
     cluster.wait_until_committed(result.index.unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applies_committed_entries_on_every_node() {
+    let cluster = Cluster::spawn(&[1, 2, 3]);
+    let (leader_id, _) = cluster.wait_for_leader().await;
+
+    let result = cluster.handles[&leader_id].propose(b"k=v".to_vec()).await;
+    assert!(result.accepted, "propose rejected: {result:?}");
+    cluster.wait_until_applied(result.index.unwrap()).await;
 }
